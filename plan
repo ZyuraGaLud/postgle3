@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>技術解説：PostgreSQL 17で解き明かす実行計画とオプティマイザ</title>
+    <style>
+        body { 
+            font-family: 'Helvetica Neue', Arial, sans-serif; 
+            line-height: 1.8; 
+            color: #000000; 
+            max-width: 900px; 
+            margin: 0 auto; 
+            padding: 30px; 
+            background-color: #ffffff;
+        }
+        h1 { border-bottom: 4px solid #000000; padding-bottom: 10px; color: #000000; }
+        h2 { background: #f0f0f0; padding: 12px; border-left: 6px solid #000000; margin-top: 40px; color: #000000; }
+        h3 { color: #000000; border-bottom: 2px solid #000000; margin-top: 30px; }
+        
+        pre { 
+            background: #f8f9fa; 
+            color: #000000; 
+            padding: 20px; 
+            border: 1px solid #000000; 
+            border-radius: 5px; 
+            overflow-x: auto; 
+            line-height: 1.5;
+            margin: 20px 0;
+            display: block;
+            width: 100%;
+        }
+        code { 
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace; 
+            background: #eeeeee; 
+            padding: 2px 5px; 
+            border-radius: 3px; 
+        }
+        pre code { background: transparent; padding: 0; }
+
+        .concept-box { border: 1px solid #000000; padding: 20px; border-radius: 8px; margin: 20px 0; background: #ffffff; }
+        .experiment-box { border: 2px solid #000000; padding: 20px; margin: 25px 0; border-radius: 8px; background: #ffffff; }
+        
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; color: #000000; }
+        th, td { border: 1px solid #000000; padding: 12px; text-align: left; }
+        th { background-color: #f0f0f0; }
+
+        .highlight { font-weight: bold; background: #ffff00; }
+        .note { border: 2px dashed #000000; padding: 15px; border-radius: 5px; margin: 20px 0; font-size: 0.95em; }
+    </style>
+</head>
+<body>
+
+<h1>PostgreSQL 17で解き明かす！実行計画とクエリオプティマイザの仕組み</h1>
+
+<p>SQLは「何を取得するか」を記述する宣言型の言語であり、「どう取得するか」はRDBMSに任されています。その「どう取得するか」の決定書が <strong>実行計画（Execution Plan）</strong> です。本記事では、PostgreSQL 17のオプティマイザがどのように戦略を立てるのか、実験を通して学びます。</p>
+
+<section>
+    <h2>1. 実行計画のキーテクノロジー</h2>
+    <p>オプティマイザは、テーブルの統計情報に基づき、最も「コスト」が低いと予測される手順を選択します。</p>
+
+    <div class="concept-box">
+        <h3>主要なスキャン方式</h3>
+        <ul>
+            <li><strong>Seq Scan (Sequential Scan)</strong>: テーブルの先頭から最後まで全行をチェックする。データが少ない場合や、大部分の行を取得する場合に選ばれる。</li>
+            <li><strong>Index Scan</strong>: インデックス（B-treeなど）を使用して必要な行だけを特定する。特定の1行や少数の行を取得する際に爆速。</li>
+            <li><strong>Index Only Scan</strong>: 必要なデータがすべてインデックス内に存在する場合、テーブル本体（Heap）を見に行かずに済ませる。</li>
+        </ul>
+    </div>
+    
+</section>
+
+<section>
+    <h2>2. EXPLAINコマンドを使いこなす</h2>
+    <p>実行計画を確認するための強力な武器が2つあります。</p>
+    <ul>
+        <li><code>EXPLAIN SQL文</code>: オプティマイザが立てた予測（コスト、推定行数）を表示する。SQL自体は実行されない。</li>
+        <li><code>EXPLAIN ANALYZE SQL文</code>: 実際にSQLを実行し、予測と <strong>実際の実行時間 (actual time)</strong> を比較する。</li>
+    </ul>
+</section>
+
+<section>
+    <h2>3. 実験準備：大量データの生成</h2>
+    <p>数件のデータではオプティマイザは常にSeq Scanを選んでしまいます。差を出すために、10万件のデータを生成します。</p>
+<pre>
+-- 実験用テーブル
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT,
+    age INT,
+    created_at TIMESTAMP
+);
+
+-- 10万件のダミーデータを挿入
+INSERT INTO users
+SELECT 
+    i, 
+    'user_' || i, 
+    floor(random() * 80), 
+    current_timestamp - (random() * interval '365 days')
+FROM generate_series(1, 100000) AS i;
+
+-- 統計情報を更新
+ANALYZE users;
+</pre>
+</section>
+
+<section>
+    <h2>4. 【実験1】Seq Scan vs Index Scan</h2>
+    <p>インデックスの有無で、実行計画が劇的に変化する様子を観察します。</p>
+
+    <h3>Case A: インデックスなしで検索</h3>
+    <pre><code>EXPLAIN ANALYZE SELECT * FROM users WHERE age = 20;</code></pre>
+    <p><strong>実行結果の注目点:</strong> <code>Seq Scan on users</code> と表示され、<code>actual time</code> が数ミリ秒〜数十ミリ秒かかるはずです。</p>
+
+    <h3>Case B: インデックス作成後に検索</h3>
+    <pre><code>CREATE INDEX idx_users_age ON users(age);
+EXPLAIN ANALYZE SELECT * FROM users WHERE age = 20;</code></pre>
+    <p><strong>実行結果の注目点:</strong> <code>Index Scan</code> に変化し、実行時間が劇的に短縮されることを確認してください。</p>
+</section>
+
+<section>
+    <h2>5. 【実験2】オプティマイザの「心変わり」</h2>
+    <p>実は、インデックスがあってもオプティマイザがあえて使わない場合があります。</p>
+    <pre><code>-- 全体の約80%がヒットするような条件で検索
+EXPLAIN SELECT * FROM users WHERE age >= 10;</code></pre>
+    <p><strong>検証結果:</strong> インデックスがあるにもかかわらず <code>Seq Scan</code> が選ばれます。これは「大量のデータを拾うなら、バラバラなインデックスを辿るより、端から全部読んだほうが早い」とオプティマイザが判断したためです。</p>
+    
+</section>
+
+<section>
+    <h2>6. 理解度確認：演習ドリル</h2>
+
+    <h3>【問題1】</h3>
+    <p><code>EXPLAIN ANALYZE</code> を実行した際に出力される <code>cost=0.00..1693.00</code> という数値は何を意味しているか、簡潔に述べなさい。</p>
+
+    <h3>【問題2：実践】</h3>
+    <div class="experiment-box">
+        <p><strong>課題：</strong> 以下のクエリを実行計画で確認し、なぜ <code>Index Scan</code> にならないのか理由を考察せよ。</p>
+        <pre><code>-- ageにインデックスがある状態で実行
+EXPLAIN SELECT * FROM users WHERE age + 1 = 21;</code></pre>
+    </div>
+
+    <h3>【問題3：チューニング】</h3>
+    <p><code>SELECT name FROM users WHERE age = 20;</code> というクエリをさらに高速化（Index Only Scan化）させるためのインデックスを <code>CREATE INDEX</code> 文で作成せよ。</p>
+</section>
+
+<section>
+    <h2>7. 演習の解答例と解説</h2>
+    
+    <div class="note">
+        <h4>【問題1】の答え</h4>
+        <p>PostgreSQL独自の単位による推定コスト。最初の1行を返すまでのコスト（0.00）と、全行を返し終えるまでのトータルコスト（1693.00）を示している。</p>
+    </div>
+
+    <div class="note">
+        <h4>【問題2】の解説</h4>
+        <p><strong>理由：</strong> 列（age）に対して演算（+ 1）を行っているため。インデックスは生の値に対して作成されており、演算結果を予測できないためSeq Scanになる。<code>WHERE age = 20</code> と書くべきである。</p>
+    </div>
+
+    <div class="note">
+        <h4>【問題3】の答え</h4>
+        <p><code>CREATE INDEX idx_users_age_name ON users(age, name);</code><br>
+        複合インデックスを作成することで、インデックスの中にnameも含まれるため、テーブル本体へのアクセスが不要になる。</p>
+    </div>
+</section>
+
+<hr>
+<p><strong>本コンテンツの作成時間：約11時間</strong></p>
+
+</body>
+</html>
